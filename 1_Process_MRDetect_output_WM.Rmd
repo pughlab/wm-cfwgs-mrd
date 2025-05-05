@@ -1,0 +1,249 @@
+---
+title: "MRDetect summary and plotting BRAWM"
+author: "Dory"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Start with STR filter then go to unique muts
+
+## Load packages
+
+Starting by loading packages
+
+## Use this script for comparisons 
+
+```{r packages}
+library(plyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(openxlsx)
+library(tidyverse)
+library(ggplot2)
+library(ggbreak) 
+library(patchwork)
+library(scales)
+library(conflicted)
+library(dplyr)
+
+conflicted::conflicts_prefer(dplyr::mutate)
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::summarize)
+
+```
+
+## Input and process the data
+
+```{r input and process data}
+### Set working variables
+path <- "MRDetect_output_winter_2025/BRAWM/"
+outdir <- "/path/Output/"
+project <- "BRAWM"
+
+### Create directories
+dir.create(outdir, showWarnings = FALSE)
+
+# Set the path to the folder containing the files
+input_path <- "/path/MRDetect_output_winter_2025/MRDetect_outputs/BRAWM"
+
+# List all CSV files in the directory
+csv_files <- list.files(input_path, pattern = "*.csv", full.names = TRUE)
+
+# Function to read a CSV and add a 'source_file' column
+read_and_label <- function(file) {
+  df <- read_csv(file)  # Read the file
+  df$source_file <- basename(file)  # Add the source file column
+  return(df)
+}
+
+# Apply the function to all files and combine them into a single data frame
+all_MRDetect_output <- bind_rows(lapply(csv_files, read_and_label))
+
+## Adding new columns 'Mut_source' and 'Filter_source' based on 'source_file'
+all_MRDetect_output <- all_MRDetect_output %>%
+  mutate(
+    Mut_source = "BM_cells",
+    Filter_source = "STR_encode")
+
+# Edit the files 
+# Remove VCF column if it is an error
+all_MRDetect_output <- all_MRDetect_output %>% dplyr::select(-VCF)
+
+# Remove "./" from the filename column
+all_MRDetect_output <- all_MRDetect_output %>%
+  mutate(filename = gsub("^\\./", "", filename))
+
+# Create new one
+all_MRDetect_output$VCF <- sub('.*_VS_', '\\1', all_MRDetect_output$filename)
+
+# Create the VCF_clean column by removing '.mutect2*' and anything following it
+all_MRDetect_output <- all_MRDetect_output %>%
+  mutate(VCF_clean = gsub("\\.mutect2.*", "", VCF))
+
+all_MRDetect_output <- all_MRDetect_output %>%
+  mutate(VCF_clean = gsub("\\.fil.*", "", VCF_clean))
+
+## Load in the metadata and try to match to it 
+## This metadata identifies which bam is which patient 
+BRAWM_metadata <- read.csv("Original/unique_bam_Brawm.csv")
+#BRAWM_metadata <- BRAWM_metadata %>% filter(!is.na(Bam))
+
+# Create a VCF_clean_merge column from the 'Bam' column in BRAWM_metadata
+BRAWM_metadata <- BRAWM_metadata %>%
+  mutate(VCF_clean_merge = gsub("\\.filter.*", "", Bam))  # Remove '.filter' and anything following it
+
+# Add study column - edit it since healthy all together
+all_MRDetect_output$Study <-  "BRAWM"
+
+### Correct labelling 
+# Change . to _ and also replace spaces with _ and remove terminal spaces
+colnames(all_MRDetect_output) <- gsub("\\s+$", "", colnames(all_MRDetect_output)) # Remove terminal spaces
+colnames(all_MRDetect_output) <- gsub("\\s+", "_", colnames(all_MRDetect_output)) # Replace spaces with _
+colnames(all_MRDetect_output) <- gsub("\\.", "_", colnames(all_MRDetect_output))  # Replace . with _
+
+
+# Rename other study column 
+temporary <- BRAWM_metadata %>%
+  dplyr::rename(Study_VCF = Study)
+
+# Merge
+Merged_MRDetect_BRAWM <- all_MRDetect_output %>% 
+  left_join(temporary %>% dplyr::select(-Bam), by = c("VCF_clean" = "VCF_clean_merge"))
+rm(all_MRDetect_output)
+
+## Then add bam info 
+temp_bam <- BRAWM_metadata %>%
+  dplyr::select(Bam, Sample_ID, Patient, Sample_type, Timepoint) %>%
+  dplyr::rename(Sample_ID_Bam = Sample_ID) %>%
+  dplyr::rename(Patient_Bam = Patient) %>%
+  dplyr::rename(Sample_type_Bam = Sample_type) %>%
+  dplyr::rename(timepoint_info_Bam = Timepoint)
+
+
+Merged_MRDetect_BRAWM <- Merged_MRDetect_BRAWM %>%
+  left_join(temp_bam, by = c("BAM" = "Bam"))
+
+
+## Now mark which samples are matched plasmas, that means plasma from same patient against its own mutation list 
+## This is used for subsequent plotting
+
+# Add plotting_type column
+Merged_MRDetect_BRAWM <- Merged_MRDetect_BRAWM %>%
+  mutate(
+    plotting_type = ifelse(Patient_Bam == Patient, "Matched_plasma", "Unmatched_plasma")
+  )
+
+# Update Sample_type_Bam for Healthy_controls samples
+Merged_MRDetect_BRAWM <- Merged_MRDetect_BRAWM %>%
+  mutate(
+    Sample_type_Bam = ifelse(Study == "Healthy_controls", "Blood_plasma_cfDNA", Sample_type_Bam)
+  )
+
+
+# Filter rows where Sample_type_Bam is Blood_plasma_cfDNA
+# Ensure Sample_type_Bam is treated as a character
+Merged_MRDetect_BRAWM_cfDNA <- Merged_MRDetect_BRAWM %>%
+  mutate(Sample_type_Bam = as.character(Sample_type_Bam))
+
+Merged_MRDetect_BRAWM_cfDNA <- Merged_MRDetect_BRAWM_cfDNA  %>%
+  dplyr::filter(Sample_type_Bam == "Blood_plasma_cfDNA")
+
+
+
+```
+
+
+## Get Z-score 
+
+```{r}
+## Get patient specific z-score 
+
+## VCF not grouping, will make it a factor 
+# Extract unique levels from the VCF column
+unique_vcf_levels <- unique(Merged_MRDetect_BRAWM$VCF)
+
+# Factor the VCF column with the unique levels
+Merged_MRDetect_BRAWM$VCF_factor <- factor(
+  Merged_MRDetect_BRAWM$VCF, 
+  levels = unique_vcf_levels
+)
+
+# Mean detection rate of reads checked over total, grouped by VCF_factor, Mut_source, and Filter_source
+Zscore_tmp <- Merged_MRDetect_BRAWM %>% 
+  dplyr::filter(Study == "Healthy_controls") %>%
+  dplyr::select(VCF_factor, Mut_source, Filter_source, detection_rate, detection_rate_as_reads_detected_over_reads_checked, detection_rate_as_reads_detected_over_total_reads, sites_detection_rate) %>%
+  dplyr::group_by(VCF_factor, Mut_source, Filter_source) %>%
+  dplyr::summarize(
+    mean_detection_rate_charm = mean(detection_rate, na.rm = TRUE), 
+    sd_detection_rate_charm = sd(detection_rate, na.rm = TRUE),
+    mean_detection_rate_reads_checked_charm = mean(detection_rate_as_reads_detected_over_reads_checked, na.rm = TRUE), 
+    sd_detection_rate_reads_checked_charm = sd(detection_rate_as_reads_detected_over_reads_checked, na.rm = TRUE),
+    mean_detection_rate_total_reads_charm = mean(detection_rate_as_reads_detected_over_total_reads, na.rm = TRUE), 
+    sd_detection_rate_total_reads_charm = sd(detection_rate_as_reads_detected_over_total_reads, na.rm = TRUE),
+    mean_sites_rate_charm = mean(sites_detection_rate, na.rm = TRUE), 
+    sd_sites_rate_charm = sd(sites_detection_rate, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+# Join back 
+#saveRDS(Merged_MRDetect_BRAWM_zscore, file = "Merged_MRDetect_BRAWM_zscore_original_Feb2025.rds")
+
+Merged_MRDetect_BRAWM_zscore <- Merged_MRDetect_BRAWM %>%
+  left_join(Zscore_tmp, by = c("VCF_factor", "Mut_source", "Filter_source"))
+
+
+# Get zscore
+Merged_MRDetect_BRAWM_zscore <- Merged_MRDetect_BRAWM_zscore %>%
+  mutate(detection_rate_zscore_charm = (detection_rate - mean_detection_rate_charm) / sd_detection_rate_charm) %>%
+  mutate(sites_rate_zscore_charm = (sites_detection_rate - mean_sites_rate_charm) / sd_sites_rate_charm) %>%
+  mutate(detection_rate_zscore_reads_checked_charm = (detection_rate_as_reads_detected_over_reads_checked - mean_detection_rate_reads_checked_charm) / sd_detection_rate_reads_checked_charm) %>%
+  mutate(detection_rate_zscore_total_reads_charm = (detection_rate_as_reads_detected_over_total_reads - mean_detection_rate_total_reads_charm) / sd_detection_rate_total_reads_charm)
+
+```
+
+
+
+## Prepare to generate plots
+
+```{r}
+
+## Identify sample type for Bam if blank 
+# Function to determine sample type based on BAM string
+identify_sample_type <- function(bam_string) {
+  if (grepl("Bm_T_WG|Bm_P|-O-DNA", bam_string)) {
+    return("BM_cells")
+  } else if (grepl("Pb_R|-B-DNA", bam_string)) {
+    return("Buffy_coat")
+  } else if (grepl("Ct_T|Cf_P|-P-DNA|Pl_T", bam_string)) {
+    return("Plasma")
+  } else {
+    return(NA)
+  }
+}
+
+# Apply function to rows where Sample_type is blank
+Merged_MRDetect_BRAWM_zscore$Sample_type <- ifelse(
+  is.na(Merged_MRDetect_BRAWM_zscore$Sample_type) | 
+  Merged_MRDetect_BRAWM_zscore$Sample_type == "", 
+  sapply(Merged_MRDetect_BRAWM_zscore$BAM, identify_sample_type), 
+  Merged_MRDetect_BRAWM_zscore$Sample_type
+)
+
+
+## Export
+write.table(Merged_MRDetect_BRAWM_zscore, file = file.path(paste0(outdir, "Merged_MRDetect_BRAWM_zscore.txt")), sep = "\t", row.names = FALSE)
+
+# Save Merged_MRDetect as an RDS file
+saveRDS(Merged_MRDetect_BRAWM_zscore, file = file.path(paste0(outdir, "Merged_MRDetect_BRAWM_zscore.rds")))
+
+
+
+### Stop here
+```
